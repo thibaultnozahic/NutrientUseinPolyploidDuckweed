@@ -1,0 +1,1604 @@
+---
+title: "Nutrient Use in Polyploid Duckweed"
+author: "Thibault Ph. Nozahic"
+date: "2026-04-28"
+output: pdf
+---
+
+# Nutrient omission experiment
+
+```{r Data & Libraries import, results='hide'}
+
+library(brms)
+library(tidybayes)
+library(bayesplot)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(tibble)
+library(stringr)
+library(deSolve)
+library(cmdstanr)
+library(purrr)
+
+#fresh weights from the nutrient omission experiment
+wo <- read.table("weight_omission.txt", sep="\t", header=TRUE, dec=",") %>%
+  mutate(time = round(time, 5),
+         id = as.factor(id),
+         time.id = as.factor(time.id)) %>%
+         dplyr::select(-day,-hour,-min, -c(10:15))
+
+#quota determined through icp-oes
+qo <- read.table("quota_omission.txt", sep="\t", header=TRUE, dec=",") %>%
+  mutate(id = as.factor(id),
+         P = round(P,3))
+
+ic <- read.table("ic_omission.txt", sep="\t", header=TRUE, dec=",") %>%
+  mutate(id = as.factor(id))
+
+#determining q0 & qend for each nutrient:ploidy couple
+Q0 <- bind_rows(
+  qo %>%
+    filter(time.id == 0, P != 0) %>%
+    group_by(medium, ploidy) %>%
+    summarise(Q0 = mean(P), .groups = "drop") %>%
+    mutate(medium = "P"),
+
+  qo %>%
+    filter(time.id == 0, N != 0) %>%
+    group_by(medium, ploidy) %>%
+    summarise(Q0 = mean(N), .groups = "drop") %>%
+    mutate(medium = "N")
+)
+
+Qend <- qo %>%
+  filter(time.id == 9) %>%
+  mutate(
+    Qend = case_when(
+      medium == "P" ~ P,
+      medium == "N" ~ N
+    )
+  ) %>%
+  group_by(medium, ploidy) %>%
+  summarise(Qend = mean(Qend), .groups = "drop")
+
+wo <- wo %>%
+  left_join(Q0, by = c("ploidy","medium")) 
+
+```
+
+`wo` for weight omission, `qo` for quota omission & `ic` for ion chromatography
+
+The Droop model (Tilman, 1977) is simplified to yield the two simplified equations:
+
+$$\frac{dN}{dt} = N \times (r \times (1 - \frac{q_{min}}Q) - m) \\ \frac{dQ}{dt} = - r \times (Q - q_{min})$$
+
+thus: $$Q(t) = q_{min} + (Q_0 - q_{min}) \times e^{-rt} \\ N(t) = \frac{e^{-mt} \times N_0 \times Q_0}{q_{min} + (Q_0 - q_{min}) \times e^{-rt}}$$
+
+$$Growth = \frac{N(t)}{N_0} \\ ln(Growth) = -m \times t + ln(Q_0) - ln(q_{min} + (Q_0 - q_{min}) \times e^{-rt})$$
+
+to formulate this equation using the probabilistic formulation of *brms*
+
+$$lnGrowth\ \mathtt{\sim}\ Normal(\mu_N, \sigma) \\ lnGrowth =  -mortality \times time + log(Q_0) - log(q_{min} + (Q_0 - q_{min}) \times  e^{-r\ time})\\ mortality + qmin + r\ \mathtt{\sim}\ \ 0 + ploidy:medium$$ the latter means that the three parameters (`mortality`, `qmin` & `r`) to fit are linked to the specified `ploidy` and `medium`
+
+```{r Building the model, priors and fitting, results='hide'}
+
+#building the model, setting the priors & fitting
+
+rubbish <- bf(lngrowth ~ 
+                 -mortality * time + log(Q0) 
+              - log(qmin + (Q0 - qmin) * exp(-r * time)),
+              
+              r + mortality + qmin ~ 0,
+              
+              nl = TRUE)
+
+#stick with this but we can try with (r ~ 0 + ploidy) only
+lnGrowth <- bf(lngrowth ~
+                  -mortality * time + log(Q0) 
+               - log(qmin + (Q0 - qmin) * exp(-r * time)),
+               
+               qmin + mortality + r ~ 0 + ploidy:medium,
+               
+               nl = TRUE)
+
+#with r ~ 0 + ploidy only
+lnGrowthrploidy <- bf(lngrowth ~
+                  -mortality * time + log(Q0) 
+               - log(qmin + (Q0 - qmin) * exp(-r * time)),
+               
+               qmin + mortality ~ 0 + ploidy:medium,
+               r ~ 0 + ploidy,
+               
+               nl = TRUE)
+
+#probably bad but still question
+lnGrowth1 <- bf(lngrowth ~
+                  -mortality * time + log(Q0) 
+               - log(qmin + (Q0 - qmin) * exp(-r * time)),
+               
+               qmin ~ 0 + ploidy:medium,
+               r + mortality ~ 0 + ploidy,
+               
+               nl = TRUE)
+
+priors <- prior(normal(0.5, 0.1), nlpar = "qmin", lb = 0) +
+          prior(normal(0.01, 0.05), nlpar = "r", lb = 0) +
+          prior(normal(0.02, 0.05), nlpar = "mortality", lb = 0) +
+          prior(cauchy(0, 0.5), class = "sigma")
+
+priors <- prior(normal(2, 5), nlpar = "qmin", lb = 0) +
+          prior(normal(0, 0.1), nlpar = "r", lb = 0) +
+          prior(normal(0, 0.1), nlpar = "mortality", lb = 0) +
+          prior(cauchy(0, 1), class = "sigma")
+
+options(mc.cores = parallel::detectCores())
+
+fitting <- brm(lnGrowth,
+               data = wo,
+               prior= priors,
+               iter = 5000, chains = 8,
+               backend="cmdstanr")
+
+#quick check of the results
+saveRDS(fitting, "fittingwithpriors0.5_0.5-0_0.1-0_0.1-0_1.modelqminmortalityandr.RDS")
+fitting <- readRDS("C:/Users/tozah/Desktop/Internship Ghent University/Protocols & Experiments/fittingwithpriors0.5_0.5-0_0.1-0_0.1-0_1.modelqminmortalityandr.RDS")
+
+summary(fitting)
+
+summfitting <- summary(posterior)
+plot(fitting)
+
+writexl::write_xlsx(summfitting, "fitting.xlsx")
+
+posterior <- as_draws_df(fitting) %>%
+  mutate(
+    `Δqmin NO3` = (`b_qmin_ploidydip:mediumN` - `b_qmin_ploidytet:mediumN`),
+    `Δqmin PO4` = (`b_qmin_ploidydip:mediumP` - `b_qmin_ploidytet:mediumP`),
+    `Δr w/o NO3` = (`b_r_ploidydip:mediumN` - `b_r_ploidytet:mediumN`),
+    `Δr w/o PO4` = (`b_r_ploidydip:mediumP` - `b_r_ploidytet:mediumP`),
+    `Δmortality w/o NO3` = (`b_mortality_ploidydip:mediumN` - `b_mortality_ploidytet:mediumN`),
+    `Δmortality w/o PO4` = (`b_mortality_ploidydip:mediumP` - `b_mortality_ploidytet:mediumP`))
+
+
+#first version for r + mortality + qmin ~ 0 + ploidy:medium
+#post is only used to plot Q(t)
+post <- as_draws_df(fitting) %>%
+  select(.draw, matches("^b_r_"), matches("^b_qmin_")) %>%
+  pivot_longer(
+    cols = - .draw,
+    names_to = "term",
+    values_to = "value"
+  ) %>%
+  mutate(
+    ploidy = ifelse(grepl("ploidydip", term), "dip", "tet"),
+    medium = ifelse(grepl("mediumN", term), "N", "P"),
+    param  = case_when(
+      grepl("^b_r_", term) ~ "r",
+      grepl("^b_qmin_", term) ~ "qmin"
+    )
+  ) %>%
+  select(.draw, ploidy, medium, param, value) %>%
+  pivot_wider(names_from = param, values_from = value)
+
+#second version for r + mortality ~ 0 + ploidy, qmin ~ 0 + ploidy:medium
+post_r <- as_draws_df(fitting) %>%
+  select(.draw, matches("^b_r_")) %>%
+  pivot_longer(cols = - .draw) %>%
+  mutate(
+    ploidy = ifelse(grepl("ploidydip", name), "dip", "tet")
+  ) %>%
+  rename(r = value)
+
+post_qmin <- as_draws_df(fitting) %>%
+  select(.draw, matches("^b_qmin_")) %>%
+  pivot_longer(cols = - .draw) %>%
+  mutate(
+    ploidy = ifelse(grepl("ploidydip", name), "dip", "tet"),
+    medium = ifelse(grepl("mediumN", name), "N", "P")
+  ) %>%
+  rename(qmin = value)
+
+```
+
+```{r Plot of the lnGrowth(t)}
+
+label_param <- function(var) {
+  case_when(
+    grepl("qmin", var)      ~ "Δ q[min]",
+    grepl("mortality", var) ~ "Δ mortality",
+    grepl("r", var)         ~ "Δ r",
+    grepl("V", var)         ~ "Δ V",
+    grepl("K", var)         ~ "Δ K"
+  )
+}
+
+label_medium <- function(var) {
+  case_when(
+    grepl("NO3|N", var) ~ "NO\u2083",
+    grepl("PO4|P", var) ~ "PO\u2084"
+  )
+}
+
+label_medium_wo <- function(var) {
+  case_when(
+    grepl("N", var) ~ "w/o NO\u2083",
+    grepl("P", var) ~ "w/o PO\u2084"
+  )
+}
+
+
+#new data set in which we'll put the estimated points
+est <- wo %>%
+  distinct(ploidy, medium) %>%
+  left_join(Q0, by = c("ploidy", "medium")) %>%
+  tidyr::crossing(time = seq(min(wo$time), max(wo$time), length.out = 200))
+
+#fitted points using the previous fitting
+pred <- fitted(fitting,
+               newdata = est,
+               re_formula = NA,
+               scale = "response") %>%
+  as.data.frame()
+
+est <- wo %>%
+  distinct(ploidy, medium) %>%
+  left_join(Q0, by = c("ploidy", "medium")) %>%
+  tidyr::crossing(time = seq(min(wo$time), max(wo$time), length.out = 200))
+
+est <- bind_cols(est, pred) %>%
+  mutate(
+    medium = c("NO3 omission", "PO4 omission")[match(medium, c("N", "P"))])
+
+#plotting with Q2.5, Q97.5
+ggplot(wo %>% mutate(medium = c("NO3 omission", "PO4 omission")[match(medium, c("N", "P"))]), aes(time, lngrowth)) +
+  geom_point(aes(color = ploidy), size = 1.5, alpha = 0.7) +
+  geom_line(data = est,
+            aes(y = Estimate, color = ploidy),
+            linewidth = 1) +
+  geom_ribbon(data = est,
+              aes(y = Estimate, ymin = Q2.5, ymax = Q97.5, fill = ploidy),
+              alpha = 0.2, color = NA) +
+  scale_color_manual(values = c("dip" = "royalblue", "tet" = "deeppink3")) +
+  scale_fill_manual(values  = c("dip" = "dodgerblue", "tet" = "deeppink")) +
+  ylab("lnGrowth") +
+  xlab("Time (days)") +
+  facet_wrap(~ medium) + 
+  theme_bw()
+
+#saving the plot
+ggsave(filename="growthfinal1.png")
+
+```
+
+```{r Plot of Q(t)}
+
+#first version for r + mortality + qmin ~ 0 + ploidy:medium
+est_Q <- est %>%
+  left_join(post, by = c("ploidy", "medium")) %>%
+  mutate(Q = qmin + (Q0 - qmin) * exp(-r * time))
+
+#second version for r + mortality ~ 0 + ploidy, qmin ~ 0 + ploidy:medium
+post_qmin_r <- post_qmin %>%
+  left_join(post_r, by = c(".draw", "ploidy"))
+
+est_Q <- est %>%
+  crossing(.draw = unique(post_qmin_r$.draw)) %>%
+  left_join(post_qmin_r, by = c("ploidy", "medium", ".draw")) %>%
+  mutate(Q = qmin + (Q0 - qmin) * exp(-r * time))
+
+#same for both we extract the median, Q2.5, Q97.5
+est_summary <- est_Q %>%
+  group_by(ploidy, medium, time) %>%
+  summarise(
+    Estimate = median(Q),
+    Q2.5     = quantile(Q, 0.025),
+    Q97.5    = quantile(Q, 0.975),
+    .groups = "drop"
+  )
+
+#the points q0 and qend together by medium and ploidy with correct time labels
+q_points <- Q0 %>%
+  left_join(Qend, by = c("medium", "ploidy")) %>%
+  tidyr::pivot_longer(
+    cols = c(Q0, Qend),
+    names_to = "label",
+    values_to = "Q"
+  ) %>%
+  mutate(time = ifelse(label == "Q0", 0, 21))
+
+#plot
+ggplot() +
+  geom_point(data = q_points,
+             aes(time, Q, color = ploidy, shape = label),
+             size = 3) +
+  geom_line(data = est_summary,
+            aes(time, Estimate, color = ploidy),
+            linewidth = 1) +
+  geom_ribbon(data = est_summary,
+              aes(time, ymin = Q2.5, ymax = Q97.5, fill = ploidy),
+              alpha = 0.2, color = NA) +
+  scale_color_manual(values = c("dip" = "royalblue", "tet" = "deeppink3")) +
+  scale_fill_manual(values = c(dip = "dodgerblue", tet = "deeppink")) +
+  facet_wrap(~ medium, scales = "free_y") +
+  theme_bw()
+
+#saving the plot
+ggsave(filename="quotastoragefinalfree_y.png")
+
+```
+
+```{r Plot the posterior parameters distribution}
+
+#first version with r and mortality ~ 0 + ploidy:medium
+df_long1 <- posterior %>%
+  dplyr::select(-.chain, -.iteration, -.draw, -sigma, -lprior, -lp__, -`Δqmin NO3`, -`Δqmin PO4`, -`Δr w/o NO3`, -`Δr w/o PO4`, -`Δmortality w/o NO3`, -`Δmortality w/o PO4`) %>%
+  tidyr::pivot_longer(everything(),
+                      names_to = "variable",
+                      values_to = "value") %>%
+  dplyr::mutate(
+    param  = stringr::str_extract(variable, "qmin|mortality|(?<=_)r(?=_)"),
+    ploidy = stringr::str_extract(variable, "dip|tet"),
+    medium = stringr::str_extract(variable, "(?<=medium)[NP]")
+  ) %>%
+  # drop any leftover posterior columns that aren't qmin/r/mortality x ploidy x
+  # medium terms -- this is what produced the spurious "NA"/"NA NA" panel
+  tidyr::drop_na(param, ploidy, medium) %>%
+  dplyr::mutate(
+    # qmin is estimated in both media; r and mortality can only be estimated
+    # from the medium where the *other* nutrient was omitted
+    medium_label = dplyr::case_when(
+      param == "qmin" & medium == "N" ~ "NO3",
+      param == "qmin" & medium == "P" ~ "PO4",
+      medium == "N" ~ "NO3 omitted",
+      medium == "P" ~ "PO4 omitted"
+    ),
+    label = paste0(ploidy, " ", medium_label),
+    # tet/dip pairs adjacent within each medium, for easier ploidy comparison
+    label = factor(label, levels = c("dip PO4", "tet PO4", "dip NO3", "tet NO3",
+                                      "dip PO4 omitted", "tet PO4 omitted",
+                                      "dip NO3 omitted", "tet NO3 omitted"))
+  )
+
+
+df_long1 %>%
+  ggplot(aes(y = label, x = value, fill = label)) +
+  geom_violin(quantiles = c(0.1, 0.5, 0.9), 
+              quantile.linetype = 1, quantile.colour = "grey95") +
+  
+  scale_fill_manual(values = c(`dip NO3` = "dodgerblue",
+                               `tet NO3` = "deeppink",
+                               `dip PO4` = "royalblue",
+                               `tet PO4` = "deeppink3",
+                               `dip NO3 omitted` = "dodgerblue",
+                               `tet NO3 omitted` = "deeppink",
+                               `dip PO4 omitted` = "royalblue",
+                               `tet PO4 omitted` = "deeppink3")) +
+  facet_wrap(~ param, scales = "free", ncol = 1,
+             labeller = as_labeller(c(qmin = "\u0394qmin (g/kg)",
+                                       r = "\u0394r (day\u207b\u00b9)",
+                                       mortality = "\u0394mortality (day\u207b\u00b9)"))) +
+  labs(x = "Posterior estimate", y = NULL, fill = NULL) +
+  theme_bw() +
+  theme(legend.position = "none")
+
+ggsave("parameeeeetersfinal.png")
+
+
+differences <- posterior %>%
+  dplyr::select(`Δqmin NO3`, `Δqmin PO4`, `Δr w/o NO3`, `Δr w/o PO4`, `Δmortality w/o NO3`, `Δmortality w/o PO4`) %>%
+  tidyr::pivot_longer(everything(),
+                      names_to = "variable",
+                      values_to = "value") %>%
+  mutate(medium = ifelse(grepl("N", variable), "N", "P"),
+         param = case_when(grepl("qmin", variable) ~ "qmin",
+                           grepl("mortality", variable) ~ "mortality",
+                           grepl("r", variable) ~ "r"))
+
+differences %>%
+  ggplot(aes(y = variable, x = value)) +
+  geom_violin(fill = "grey50", color = "grey30", quantiles = c(0.1, 0.5, 0.9), 
+              quantile.linetype = 1, quantile.colour = "black") +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.7) +
+  labs(x = "Posterior estimate", y = NULL, fill = NULL) +
+  facet_wrap(~ param, nrow = 3, scales = "free") +
+  theme_bw()
+
+#other representation but with r and mortality independent from nutrient so only ploidy-related
+df_long <- posterior %>%
+  dplyr::select(-.chain, -.iteration, -.draw, -sigma, -lprior, -lp__) %>%
+  tidyr::pivot_longer(everything(),
+                      names_to = "variable",
+                      values_to = "value") %>%
+  dplyr::mutate(
+    param  = stringr::str_extract(variable, "qmin|mortality|(?<=_)r(?=_)"),
+    ploidy = stringr::str_extract(variable, "dip|tet"),
+    medium = stringr::str_extract(variable, "(?<=medium)[NP]"),
+    label  = paste0(ploidy, ".", ifelse(is.na(medium), "", medium))
+  )
+
+df_quantiles <- df_long %>%
+  summarise(
+    q5 = quantile(value, 0.05),
+    q95 = quantile(value, 0.95),
+    .by = c(label, param)
+  )
+
+df_long %>%
+  ggplot(aes(x = label, y = value, fill = label)) +
+  geom_violin() +
+
+  geom_segment(
+    data = df_quantiles,
+    aes(
+      x = label,
+      xend = label,
+      y = q5,
+      yend = q95,
+    ),
+    color = "white",
+    linewidth = 0.7,
+    inherit.aes = FALSE
+  ) +
+  
+  stat_summary(fun = median, geom = "point", color = "white", size = 1) +
+  scale_fill_manual(values = c(dip.N = "dodgerblue", 
+                               dip.P = "royalblue", 
+                               tet.N = "deeppink", 
+                               tet.P = "deeppink3",
+                               dip. = "dodgerblue",
+                               tet. = "deeppink")) +
+  facet_wrap(~ param, scales = "free", ncol = 1) +
+  facet_grid(~ param, scales = "free", space = "free") +
+  labs(x = "Posterior estimate", y = NULL, fill = NULL) +
+  theme_bw() +
+  theme(legend.position = "hidden")
+
+#saving the plot
+ggsave(filename="diffparamfinalfinal.png")
+
+```
+
+# Nutrient uptake experiment
+
+```{r Data counterfeit & import, results='hide'}
+library(brms)
+library(tidybayes)
+library(bayesplot)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(tibble)
+library(stringr)
+library(deSolve)
+library(cmdstanr)
+library(purrr)
+
+##==============================================================================
+
+##==============================================================================
+S_function <- function(time, state, parms) {
+  S  <- state[["S"]]
+  N0 <- parms[["N0"]]
+  r <- parms[["r"]]
+  V  <- parms[["V"]]
+  K  <- parms[["K"]]
+
+  dS <- -N0 * exp(r * time) * V * S / (K + S)
+  list(c(dS))
+}
+
+conditions <- tibble(
+condition = c("dip0.25P", "dip0.1P", "dip0.02P", "dip0.2N", "dip0.1N", "dip0.02N", "dip0.005N","tet0.25P", "tet0.1P", "tet0.02P", "tet0.2N", "tet0.1N", "tet0.02N", "tet0.005N"
+),
+ploidy = c(
+"dip","dip","dip","dip","dip","dip","dip",
+"tet","tet","tet","tet","tet","tet","tet"),
+nutrient = c(
+"P","P","P","N","N","N","N",
+"P","P","P","N","N","N","N"),
+V = c(
+1,1,1,5,5,5,5,
+2,2,2,6,6,6,6),
+K = c(
+3,2,4,60,76,63,70,
+2,3,5,58,61,61,67),
+r = c(
+0.2,0.2,0.2,0.2,0.2,0.2,0.2,
+0.1,0.1,0.1,0.1,0.1,0.1,0.1),
+S_N = c(
+550, 550, 550, 110, 55, 11, 2.5,
+550, 550, 550, 110, 55, 11, 2.5),
+S_P = c(
+12.5, 5, 1, 50, 50, 50, 50,
+12.5, 5, 1, 50, 50, 50, 50),
+N0 = 1
+)
+
+time <- seq(from = 0, to = 10, by = 10)
+
+counterfeit <- function(V, K, r, N0, S_N, S_P, nutrient) {
+  S0 <- if (nutrient == "N") S_N else S_P
+
+  parms <- c(N0 = N0, r = r, V = V, K = K)
+  state <- c(S = S0)
+
+  deSolve::ode(y = state, times = time, func = S_function, parms = parms) %>%
+    as.data.frame()
+}
+
+output <- conditions %>%
+  mutate(output = pmap(
+    list(V, K, r, N0, S_N, S_P, nutrient),
+    counterfeit
+  ))
+
+noise <- 0
+
+out <- output %>%
+  unnest(output) %>%
+  mutate(
+    R_true   = S,
+    R_obs    = R_true + rnorm(n(), mean = 0, sd = noise),
+    logR_obs = log(R_obs),
+    R0       = if_else(nutrient == "N", S_N, S_P)
+  ) %>%
+  select(condition, ploidy, nutrient, time, R_true, R_obs, logR_obs,
+         R0, N0, r, V, K) %>%
+  filter(time > 0)
+
+##==============================================================================
+
+#import the real data
+
+nu <- read.table("nutrient_uptake_incomplete.txt", header = T, sep = "\t", dec = ",") %>%
+  select(id, ploidy, medium, rep, observer, 
+         time, weight0, weight_pot_lid, weight_pot_lid_med, total_weight_begin, total_weight_end, fw.end, growth, lngrowth,
+         mg.l.SO4, mg.l.NO3, mg.l.PO4) %>%
+  mutate(condition = interaction(ploidy, medium, sep = ";"),
+         volume = (weight_pot_lid_med - weight_pot_lid)/1000,
+         conc.weight0 = weight0 * volume,
+         conc.fw = fw.end * volume,
+         growth = conc.fw / conc.weight0,
+         lngrowth = log(growth),
+         r = ifelse(ploidy == "dip", 0.06622310, 0.05511983),
+         N0 = conc.weight0,
+         time = round(time, 5)) %>%
+  rename(
+    NO3 = mg.l.NO3,
+    PO4 = mg.l.PO4
+  ) %>%
+  pivot_longer(
+    cols = c("NO3", "PO4"),
+    values_to = "S_unscaled",
+    names_to = "nutrient"
+  ) %>%
+  filter(
+    (grepl("N", medium) & nutrient == "NO3") |
+    (grepl("P", medium) & nutrient == "PO4") |
+    (medium == "0.2N")) %>%
+  mutate(censored = ifelse(is.na(S_unscaled), -1, 0),
+         S_unscaled = ifelse(is.na(S_unscaled), 0.2, S_unscaled),
+         S_scaled = S_unscaled * (96.06/mg.l.SO4),
+         logS = log(S_scaled)) %>%
+  group_by(medium, nutrient) %>%
+  mutate(S0 = mean(S_scaled[time == 0], na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(
+    mednut = paste0(nutrient, "::", medium),
+    ploinut = paste0(ploidy, "::", medium, "::", nutrient))
+
+S0 <- nu %>%
+  filter(time == 0) %>%
+  select(medium, nutrient, S0) %>%
+  distinct() %>%
+  as.data.frame()
+
+ggplot(nu, aes(medium, S_scaled, color = ploidy)) +
+  geom_point(size = 1.5, alpha = 0.7) +
+  scale_color_manual(values = c("dip" = "royalblue", "tet" = "deeppink3")) +
+  scale_fill_manual(values  = c("dip" = "dodgerblue", "tet" = "deeppink")) +
+  facet_wrap(~ nutrient, scales = "free") +
+  theme_bw()
+
+ggplot(nu%>%filter(medium == "0.005N", nutrient == "NO3"), aes(ploidy, logS, color = ploidy)) +
+  geom_point(size = 1.5, alpha = 0.7) +
+  scale_color_manual(values = c("dip" = "royalblue", "tet" = "deeppink3")) +
+  scale_fill_manual(values  = c("dip" = "dodgerblue", "tet" = "deeppink")) +
+  theme_bw()
+
+
+```
+
+```{r C++ Stan code, results='hide'}
+
+ode <- "
+vector dXdt(real time,
+            vector X,
+            array[] real theta) {
+
+  real V = theta[1];
+  real logK = theta[2];
+  real N0   = theta[3];
+  real r    = theta[4];
+  
+  real K = exp(logK);
+
+  vector[1] dXdt;
+  dXdt[1] = -N0 * exp(r * time) * V / (K + exp(X[1]));
+  return dXdt;
+}
+
+real Rintegrator(real time, real S0, real V, real logK, real N0, real r) {
+  vector[1] y0;
+  array[4] real alpha;
+
+  y0[1] = S0;
+
+  alpha[1] = V;
+  alpha[2] = logK;
+  alpha[3] = N0;
+  alpha[4] = r;
+
+  real t0 = 0.0;
+  real ts = time;
+  if (ts <= t0) {
+    ts = t0 + 1e-9;
+  }
+
+  array[1] vector[1] y;
+  y = ode_rk45(dXdt, y0, t0, rep_array(ts, 1), alpha);
+
+  return y[1][1];
+}
+"
+
+odelog <- "
+vector dXdt(real time,
+            vector X,
+            array[] real theta) {
+
+  real logV = theta[1];
+  real logK = theta[2];
+  real N0   = theta[3];
+  real r    = theta[4];
+
+  real V = exp(logV);
+  real K = exp(logK);
+
+  vector[1] dXdt;
+  dXdt[1] = -N0 * exp(r * time) * V / (K + exp(X[1]));
+  return dXdt;
+}
+
+real Rintegratorlog(real time, real S0, real logV, real logK, real N0, real r) {
+  vector[1] y0;
+  array[4] real alpha;
+
+  y0[1] = log(S0);
+
+  alpha[1] = logV;
+  alpha[2] = logK;
+  alpha[3] = N0;
+  alpha[4] = r;
+
+  real t0 = 0.0;
+  real ts = time;
+  if (ts <= t0) {
+    ts = t0 + 1e-9;
+  }
+
+  array[1] vector[1] y;
+  y = ode_rk45(dXdt, y0, t0, rep_array(ts, 1), alpha);
+
+  return exp(y[1][1]);
+}
+"
+
+odelogS <- "
+  vector dSdt(real t,
+              vector S,
+              array[] real theta) {
+
+    real V = theta[1];
+    real K   = theta[2];
+    real N0    = theta[3];   
+    real r    = theta[4];   
+    vector[1] dSdt;
+    dSdt[1] = -1*N0*exp(r*t) * V * S[1] / (K + S[1]);
+    return dSdt;
+    }
+
+real Rintegrator(real t, real S0, real V, real K, real N0, real r) {
+  vector[1] y0;
+  array[4] real alpha;// Parameters
+  
+  y0[1] = S0;
+
+  alpha[1] = V; 
+  alpha[2] = K;
+  alpha[3] = N0;
+  alpha[4] = r;
+
+  array[1] vector[1] y;
+  y = ode_rk45(dSdt,
+                y0, 0, rep_array(t, 1),
+                //0.01, 0.01, 100,
+                alpha); 
+  return y[1][1];
+}
+"
+```
+
+```{r BRMS run, results='hide'}
+
+options(mc.cores = parallel::detectCores())
+
+lilgrowth <- bf(growth ~ exp(r * time/24),  r ~ 0 + ploidy,  nl = TRUE)
+r <- prior(normal(0,1), nlpar = r, lb = 0)
+fitlilgrowth <- brm(lilgrowth, data = nu, prior = r, backend = "cmdstanr")
+summary(fitlilgrowth)
+fitidoodie <- as_draws_df(fitlilgrowth)
+summary(fitidoodie)
+
+bf_logS <- bf(
+  logS | cens(censored) ~
+    log(Rintegrator(time/24, S0, V, K, N0, r))+o,
+  nlf(V ~ exp(logV)),
+  nlf(K ~ exp(logK)),
+  logV + logK ~ 0 + ploidy:nutrient,
+  o ~ 0 + (1|observer),
+  nl = TRUE
+)
+
+get_prior(bf_logS, data = nu)
+priors <- c(
+  prior(normal(6, 2), class = "b", nlpar = "logV"),
+  prior(normal(2, 2), class = "b", nlpar = "logK"),
+  prior(cauchy(0, 0.1), class = "sd", nlpar = "o"),
+  prior(cauchy(0, 1), class = "sigma")
+)
+
+fodebest <- brm(
+  formula = bf_logS,
+  data = nu,
+  prior = priors,
+  stanvars = stanvar(scode = odelogS, block = "functions"),
+  backend = "cmdstanr"
+)
+
+summary(fodebest)
+fodebest$fit
+plot(fodebest)
+
+saveRDS(fodebest, file = "fodebestlast.RDS")
+fode <- readRDS("C:/Users/tozah/Desktop/Internship Ghent University/Protocols & Experiments/fodedata6.1august.RDS")
+
+expose_functions(fodebest, vectorize = T)
+
+posteriorVK <- as_draws_df(fodebest)
+
+est1 <- nu %>%
+  filter(!is.na(N0)) %>%
+  distinct(ploidy, medium, nutrient, N0, r, S0, id) %>%
+  tidyr::crossing(time = seq(1e-9, 25, length.out = 10)) %>%
+  mutate(
+    ploidy   = factor(ploidy,   levels = c("dip", "tet")),
+    nutrient = factor(nutrient, levels = c("NO3", "PO4")),
+    condition = interaction(ploidy, medium, sep = "::"),
+    id = factor(id)
+  )
+
+#fitted points using the previous fitting
+
+fodepred <- fitted(
+  fodebest,
+  newdata = est1,
+  re_formula = NA
+)
+
+fodepredback <- fodepred %>% 
+  as.data.frame() %>%
+  mutate(
+    est1, 
+    across(c(1, 3, 4), exp),
+    mednut = paste0(nutrient, "::", medium),
+    ploinut = paste0(ploidy, "::", medium, "::", nutrient)
+  )
+
+
+ggplot(nu, aes(time, S_scaled, group = id)) +
+  geom_point(aes(color = ploidy), size = 1.5, alpha = 0.7) +
+  geom_line(data = fodepredback,
+            aes(y = Estimate, color = ploidy),
+            linewidth = 0.5) +
+  geom_ribbon(data = fodepredback,
+              aes(y = Estimate, ymin = Q2.5, ymax = Q97.5, 
+                  color = ploidy, fill = ploidy),
+              alpha = 0.1, color = NA) +
+  scale_color_manual(values = c("dip" = "royalblue", "tet" = "deeppink3")) +
+  scale_fill_manual(values  = c("dip" = "dodgerblue", "tet" = "deeppink")) +
+  facet_wrap(~ mednut, scales = "free_y", ncol = 4) +
+  theme_bw()
+
+ggsave("besttry88889log.png")
+
+```
+
+```{r }
+
+
+ggplot(nu, aes(time, S_scaled)) +
+  geom_point(aes(color = ploidy), size = 1.5, alpha = 0.7) +
+  scale_color_manual(values = c("dip" = "royalblue", "tet" = "deeppink3")) +
+  scale_fill_manual(values  = c("dip" = "dodgerblue", "tet" = "deeppink")) +
+  facet_wrap(~ nutrient, scales = "free_y") +
+  theme_bw()
+
+geom_line(data = estS_summary,
+            aes(y = Estimate, color = ploidy),
+            linewidth = 1) +
+  geom_ribbon(data = estS_summary,
+              aes(y = Estimate, ymin = Q2.5, ymax = Q97.5, fill = ploidy),
+              alpha = 0.2, color = NA)
+
+posteriorVK__ <- posteriorVK %>%
+  mutate(
+    across(c(1:8), exp),
+    dVN = `b_logV_ploidydip:nutrientNO3` - `b_logV_ploidytet:nutrientNO3`,
+    dVP = `b_logV_ploidydip:nutrientPO4` - `b_logV_ploidytet:nutrientPO4`,
+    dKN = `b_logK_ploidydip:nutrientNO3` - `b_logK_ploidytet:nutrientNO3`,
+    dKP = `b_logK_ploidydip:nutrientPO4` - `b_logK_ploidytet:nutrientPO4`
+  )
+
+names(posteriorVK)
+
+df_longVK <- posteriorVK__ %>%
+  dplyr::select(-.chain, -.iteration, -.draw, -sigma, -lprior, -lp__, -dVN, -dVP, -dKN, -dKP, -sd_observer__o_Intercept, -`r_observer__o[Frederik,Intercept]`, -`r_observer__o[Thibault,Intercept]`) %>%
+  tidyr::pivot_longer(everything(),
+                      names_to = "variable",
+                      values_to = "value") %>%
+  dplyr::mutate(
+    param  = stringr::str_extract(variable, "V|K|(?<=_)r(?=_)"),
+    ploidy = stringr::str_extract(variable, "dip|tet"),
+    medium = stringr::str_extract(variable, "NO3|PO4"),
+    label  = paste0(ploidy, ".", medium),
+    parlab = paste0(param, ".", medium)
+  )
+
+df_longVK %>%
+  ggplot(aes(y = label, x = value, fill = label)) +
+  geom_violin(quantiles = c(0.1, 0.5, 0.9), 
+              quantile.linetype = 1, quantile.colour = "grey95") +
+  
+  scale_fill_manual(values = c(dip.NO3 = "dodgerblue", 
+                               dip.PO4 = "royalblue", 
+                               tet.NO3 = "deeppink", 
+                               tet.PO4 = "deeppink3")) +
+  facet_wrap(~ parlab, scales = "free", ncol = 1) +
+  labs(x = "Posterior estimate", y = NULL, fill = NULL) +
+  theme_bw() +
+  theme(legend.position = "right")
+
+ggsave("trybest888.png")
+
+differences <- posteriorVK__ %>%
+  dplyr::select(dVN, dVP, dKN, dKP) %>%
+  tidyr::pivot_longer(everything(),
+                      names_to = "variable",
+                      values_to = "value") %>%
+  mutate(medium = ifelse(grepl("NO3", variable), "NO3", "PO4"),
+         param = case_when(grepl("V", variable) ~ "V",
+                           grepl("K", variable) ~ "K"))
+
+
+names(posteriorVK__)
+
+
+differences %>%
+  ggplot(aes(y = variable, x = value)) +
+  geom_violin(fill = "grey50", color = "grey30", quantiles = c(0.1, 0.5, 0.9), 
+              quantile.linetype = 1, quantile.colour = "black") +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.7) +
+  labs(x = "Posterior estimate", y = NULL, fill = NULL) +
+  facet_wrap(~ param, nrow = 3, scales = "free") +
+  theme_bw()
+
+ggsave("besttry888.png")
+
+```
+
+```{r Finding R* and consumption vectors}
+
+#Finding R*
+
+Rpost <- as_draws_df(fitting)
+
+RpostVK <- as_draws_df(fodebest)
+
+R_etoile_post <- data.frame()
+R_etoile_post <- Rpost %>%
+  left_join(RpostVK, by = join_by(.draw)) %>%
+  mutate(
+    K_dip_NO3 = exp(`b_logK_ploidydip:nutrientNO3`),
+    K_tet_NO3 = exp(`b_logK_ploidytet:nutrientNO3`),
+    K_dip_PO4 = exp(`b_logK_ploidydip:nutrientPO4`),
+    K_tet_PO4 = exp(`b_logK_ploidytet:nutrientPO4`),
+
+    V_dip_NO3 = exp(`b_logV_ploidydip:nutrientNO3`),
+    V_tet_NO3 = exp(`b_logV_ploidytet:nutrientNO3`),
+    V_dip_PO4 = exp(`b_logV_ploidydip:nutrientPO4`),
+    V_tet_PO4 = exp(`b_logV_ploidytet:nutrientPO4`),
+
+    R_min_dip_NO3 = (`b_r_ploidydip:mediumN` * `b_qmin_ploidydip:mediumN` * `K_dip_NO3` * `b_mortality_ploidydip:mediumN`) /
+                    (`V_dip_NO3` * (`b_r_ploidydip:mediumN` - `b_mortality_ploidydip:mediumN`) -
+                     `b_r_ploidydip:mediumN` * `b_qmin_ploidydip:mediumN` * `b_mortality_ploidydip:mediumN`),
+    R_min_tet_NO3 = (`b_r_ploidytet:mediumN` * `b_qmin_ploidytet:mediumN` * `K_tet_NO3` * `b_mortality_ploidytet:mediumN`) /
+                    (`V_tet_NO3` * (`b_r_ploidytet:mediumN` - `b_mortality_ploidytet:mediumN`) -
+                     `b_r_ploidytet:mediumN` * `b_qmin_ploidytet:mediumN` * `b_mortality_ploidytet:mediumN`),
+    R_min_dip_PO4 = (`b_r_ploidydip:mediumP` * `b_qmin_ploidydip:mediumP` * `K_dip_PO4` * `b_mortality_ploidydip:mediumP`) /
+                    (`V_dip_PO4` * (`b_r_ploidydip:mediumP` - `b_mortality_ploidydip:mediumP`) -
+                     `b_r_ploidydip:mediumP` * `b_qmin_ploidydip:mediumP` * `b_mortality_ploidydip:mediumP`),
+    R_min_tet_PO4 = (`b_r_ploidytet:mediumP` * `b_qmin_ploidytet:mediumP` * `K_tet_PO4` * `b_mortality_ploidytet:mediumP`) /
+                    (`V_tet_PO4` * (`b_r_ploidytet:mediumP` - `b_mortality_ploidytet:mediumP`) -
+                     `b_r_ploidytet:mediumP` * `b_qmin_ploidytet:mediumP` * `b_mortality_ploidytet:mediumP`))
+
+R_tidy <- R_etoile_post %>%
+  select(.draw,
+         R_min_dip_NO3,
+         R_min_tet_NO3,
+         R_min_dip_PO4,
+         R_min_tet_PO4) %>%
+  pivot_longer(
+    cols = starts_with("R_min"),
+    names_to = c("ploidy", "nutrient"),
+    names_pattern = "R_min_(.*)_(.*)",
+    values_to = "R_min"
+  )
+
+R_summary <- R_tidy %>%
+  group_by(ploidy, nutrient) %>%
+  summarise(
+    median = median(R_min, 0.50, na.rm = TRUE),
+    p10 = quantile(R_min, 0.10, na.rm = TRUE),
+    p90 = quantile(R_min, 0.90, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+R_points <- R_etoile_post %>%
+  select(.draw,
+         R_min_dip_NO3, R_min_dip_PO4,
+         R_min_tet_NO3, R_min_tet_PO4) %>%
+  pivot_longer(
+    cols = starts_with("R_min"),
+    names_to = c("ploidy", "nutrient"),
+    names_pattern = "R_min_(.*)_(.*)",
+    values_to = "R_min") %>%
+  pivot_wider(
+    names_from = nutrient,
+    values_from = R_min,
+    names_prefix = "R_min_") %>%
+  filter(R_min_PO4 <= 0.00015,
+         R_min_NO3 <= 0.003)
+
+summary(posteriorVK__)
+
+posteriorVK_summary <- summary(posteriorVK__) %>%
+  as_tibble() %>%
+  select(variable, median)
+
+VK_medians <- posteriorVK_summary %>%
+  filter(str_detect(variable, "b_log")) %>%
+  mutate(
+    param    = str_extract(variable, "(?<=b_log)(V|K)"),
+    ploidy   = str_extract(variable, "(?<=ploidy)(dip|tet)"),
+    nutrient = str_extract(variable, "(?<=nutrient)(NO3|PO4)"),
+    median   = median   # undo log
+  ) %>%
+  select(param, ploidy, nutrient, median) %>%
+  pivot_wider(names_from = param, values_from = median)
+
+nu_medians <- nu %>%
+  group_by(ploidy, nutrient) %>%
+  summarise(
+    r  = median(r),
+    N0 = median(N0),
+    S0 = max(S0),
+    .groups = "drop"
+  )
+
+params <- VK_medians %>%
+  left_join(nu_medians, by = c("ploidy", "nutrient"))
+t <- 0
+
+consumption_vectors <- params %>%
+  mutate(
+    dSdt = -N0 * exp(r * t) * (V * S0) / (S0 + K)
+  ) %>%
+  # reshape to NO3/PO4 pairs
+  select(ploidy, nutrient, dSdt) %>%
+  pivot_wider(names_from = nutrient, values_from = dSdt) %>%
+  mutate(
+    norm  = sqrt(NO3^2 + PO4^2),
+    u_NO3 = NO3 / norm,
+    u_PO4 = PO4 / norm,
+    slope = NO3 / PO4,
+    angle = atan2(PO4, NO3)
+  )
+
+arrow_df <- consumption_vectors %>%
+  mutate(
+    x_start = ifelse(ploidy == "dip", R_summary %>% filter(ploidy=="dip", nutrient=="NO3") %>% pull(median), R_summary %>% filter(ploidy=="tet", nutrient=="NO3") %>% pull(median)),
+    y_start = ifelse(ploidy == "dip", R_summary %>% filter(ploidy=="dip", nutrient=="PO4") %>% pull(median), R_summary %>% filter(ploidy=="tet", nutrient=="PO4") %>% pull(median)),
+    x_end = x_start + 0.0001 * u_NO3,
+    y_end = y_start + 0.0001 * u_PO4,
+    x_vec = x_start - 0.0003 * u_NO3,
+    y_vec = y_start - 0.0003 * u_PO4
+  )
+
+
+
+ggplot() +
+  
+  geom_segment(aes(
+    x = R_summary %>% filter(ploidy=="dip", nutrient=="NO3") %>% pull(median), xend = 3e-3,
+    y = R_summary %>% filter(ploidy=="dip", nutrient=="PO4") %>% pull(median), yend = R_summary %>% filter(ploidy=="dip", nutrient=="PO4") %>% pull(median)),
+    color = "dodgerblue", linewidth = 1) +
+  
+  geom_segment(aes(
+    x = R_summary %>% filter(ploidy=="dip", nutrient=="NO3") %>% pull(median), xend = R_summary %>% filter(ploidy=="dip", nutrient=="NO3") %>% pull(median),
+    y = R_summary %>% filter(ploidy=="dip", nutrient=="PO4") %>% pull(median), yend = 1.5e-4),
+    color = "dodgerblue", linewidth = 1) +
+  
+  geom_segment(aes(
+    x = R_summary %>% filter(ploidy=="tet", nutrient=="NO3") %>% pull(median), xend = 3e-3,
+    y = R_summary %>% filter(ploidy=="tet", nutrient=="PO4") %>% pull(median), yend = R_summary %>% filter(ploidy=="tet", nutrient=="PO4") %>% pull(median)),
+    color = "deeppink", linewidth = 1) +
+  
+  geom_segment(aes(
+    x = R_summary %>% filter(ploidy=="tet", nutrient=="NO3") %>% pull(median), xend = R_summary %>% filter(ploidy=="tet", nutrient=="NO3") %>% pull(median),
+    y = R_summary %>% filter(ploidy=="tet", nutrient=="PO4") %>% pull(median), yend = 1.5e-4),
+    color = "deeppink", linewidth = 1) +
+  
+  geom_segment(aes(x = R_summary %>% filter(ploidy=="dip", nutrient=="NO3") %>% pull(p10),xend = dip_N_p90  <- R_summary %>% filter(ploidy=="dip", nutrient=="NO3") %>% pull(p90),y = R_summary %>% filter(ploidy=="dip", nutrient=="PO4") %>% pull(median),yend = R_summary %>% filter(ploidy=="dip", nutrient=="PO4") %>% pull(median)),color = "darkblue", linewidth = 2, alpha = 0.5) +
+  geom_segment(aes(x = R_summary %>% filter(ploidy=="dip", nutrient=="NO3") %>% pull(median),xend = R_summary %>% filter(ploidy=="dip", nutrient=="NO3") %>% pull(median),y = R_summary %>% filter(ploidy=="dip", nutrient=="PO4") %>% pull(p10),yend = R_summary %>% filter(ploidy=="dip", nutrient=="PO4") %>% pull(p90)),color = "darkblue", linewidth = 2, alpha = 0.5) +
+  
+  geom_segment(aes(x = R_summary %>% filter(ploidy=="tet", nutrient=="NO3") %>% pull(p10), xend = R_summary %>% filter(ploidy=="tet", nutrient=="NO3") %>% pull(p90),y = R_summary %>% filter(ploidy=="tet", nutrient=="PO4") %>% pull(median),yend = R_summary %>% filter(ploidy=="tet", nutrient=="PO4") %>% pull(median)),color = "deeppink4", linewidth = 2, alpha = 0.5) +
+  geom_segment(aes(x = R_summary %>% filter(ploidy=="tet", nutrient=="NO3") %>% pull(median),xend = R_summary %>% filter(ploidy=="tet", nutrient=="NO3") %>% pull(median),y = R_summary %>% filter(ploidy=="tet", nutrient=="PO4") %>% pull(p10),yend = R_summary %>% filter(ploidy=="tet", nutrient=="PO4") %>% pull(p90)),color = "deeppink4", linewidth = 2, alpha = 0.5) +
+  geom_segment(
+    data = arrow_df,
+    aes(x = x_start, y = y_start,
+        xend = x_end, yend = y_end,
+        color = ploidy),
+    linewidth = 1,
+    arrow = arrow(length = unit(0.25, "cm"))
+  ) +
+  scale_colour_manual(values = c("dip" = "dodgerblue", "tet" = "deeppink")) +
+  geom_segment(
+    data = arrow_df,
+    aes(x = x_start, y = y_start,
+        xend = x_vec, yend = y_vec,
+        color = ploidy),
+    linewidth = 0.5, linetype = 2) +
+  #geom_density2d(data = R_points %>% filter(ploidy == "dip"),aes(x = R_min_NO3, y = R_min_PO4),colour = "royalblue3",alpha = 0.2) +
+  #geom_density2d(data = R_points %>% filter(ploidy == "tet"),aes(x = R_min_NO3, y = R_min_PO4),colour = "deeppink3",alpha = 0.2) +
+
+  geom_point(data = R_points %>% filter(ploidy == "dip"),aes(x = R_min_NO3, y = R_min_PO4),color = "dodgerblue", alpha = 0.1, size = 0.5) +
+  
+  geom_point(data = R_points %>% filter(ploidy == "tet"),aes(x = R_min_NO3, y = R_min_PO4),color = "deeppink", alpha = 0.1, size = 0.5) +
+  xlab("NO3 (mg/L)") +
+  ylab("PO4 (mg/L)") +
+  theme_bw()
+
+ggsave("Rstar_consumption_vectors100.png", width = 6, height = 5)
+
+```
+
+```{r}
+summary(posterior)
+parameters_simple <- summary(posterior) %>%
+  dplyr::select(variable, mean)
+
+summary(posteriorVK)
+parameters_simpleVK <- summary(posteriorVK) %>%
+  dplyr::select(variable, mean)
+
+VK_ <- parameters_simpleVK %>%
+  filter(grepl("logV_", variable) | grepl("logK_", variable)) %>%
+  mutate(
+    ploidy = ifelse(grepl("ploidydip", variable), "dip", "tet"),
+    medium = ifelse(grepl("nutrientN", variable), "N", "P"),
+    param  = ifelse(grepl("logV_", variable), "logV", "logK")
+  ) %>%
+  select(ploidy, medium, param, mean) %>%
+  tidyr::pivot_wider(names_from = param, values_from = mean) %>%
+  mutate(
+    V = exp(logV),
+    K   = exp(logK)
+  )
+
+R_ <- parameters_simple %>%
+  filter(grepl("b_r_", variable) | grepl("b_qmin_", variable) | grepl("b_mortality_", variable)) %>%
+  mutate(
+    ploidy = ifelse(grepl("ploidydip", variable), "dip", "tet"),
+    medium = ifelse(grepl("mediumN", variable), "N", "P"),
+    param = case_when(
+      grepl("b_r_", variable) ~ "r",
+      grepl("b_qmin_", variable) ~ "qmin",
+      grepl("b_mortality_", variable) ~ "mortality")
+  ) %>%
+  select(ploidy, medium, param, mean) %>%
+  tidyr::pivot_wider(names_from = param, values_from = mean)
+
+R_etoile <- R_ %>%
+  left_join(VK_, by = c("ploidy", "medium")) %>%
+  left_join(
+    nu %>% select(ploidy, nutrient, condition),
+    by = c("ploidy" = "ploidy", "medium" = "nutrient")) %>%
+  mutate(
+    R_min = (r * qmin * K * mortality) /
+            (V * (r - mortality) - r * qmin * mortality)) %>%
+  mutate(nutrient = medium) %>%
+  select(-condition)
+
+R_etoile_dip <- R_etoile %>%
+  filter(ploidy == "dip") %>%
+  select(ploidy, nutrient, R_min) %>%
+  distinct()
+R_etoile_tet <- R_etoile %>%
+  filter(ploidy == "tet") %>%
+  select(ploidy, nutrient, R_min) %>%
+  distinct()
+
+
+nutrient.ratio <- bind_rows(
+  R_etoile_dip %>%
+    pivot_wider(names_from = medium, values_from = R_min) %>%
+    mutate(ratio = N / P),
+  R_etoile_tet %>%
+    pivot_wider(names_from = medium, values_from = R_min) %>%
+    mutate(ratio = N / P)
+)
+
+ggplot(nutrient.ratio) +
+  geom_vline(aes(xintercept = ratio, color = ploidy),
+    linewidth = 0.7, linetype = "dashed") +
+  geom_jitter(data = nu, aes(x = ratio, y = ploidy, color = ploidy),
+            height = 0.2, width = 0) +
+  scale_color_manual(values = c("dip" = "royalblue", "tet" = "deeppink3")) +
+  annotate("text", x = 35, y = 1, xend = 36, label = paste0("Phosphate limited"), size = 3.5) +
+  annotate("text", x = 28.8, y = 1, xend = 28, label = paste0("Nitrate limited"), size = 3.5) +
+  annotate("text", x = 31.9, y = 1, label = paste0("Coexistence zone"), size = 3.5) +
+  scale_x_log10(breaks = c(0.1, 10, 100)) +
+  labs(x = "NO3/PO4") + 
+  theme_minimal()
+
+
+#how big the vectors, coexistence dashed lines should be
+sc <- 0.05
+
+nu0 <- nu %>%
+  select(ploidy, medium, nutrient, S0) %>%
+  filter(ploidy == c("dip", "tet"))
+  
+consumption <- R_etoile %>%
+  left_join(nu0) %>%
+  mutate(
+    condition = interaction(ploidy, medium),
+    N0 = 1,
+    S0 = mean(S0, na.rm = T),
+    S_t = (N0 * V * (S0 / (K + S0)))) %>%
+  select(ploidy, nutrient, medium, condition, S_t) %>%
+  group_by(condition) %>%
+  mutate(meanS_t = mean(S_t, na.rm = TRUE)) %>%
+  ungroup()
+
+consumption_vectors <- consumption %>%
+  mutate(
+    S_N = ifelse(nutrient == "N", meanS_t, meanS_t[nutrient == "N" & ploidy == "dip"]),
+    S_P = ifelse(nutrient == "P", meanS_t, meanS_t[nutrient == "P" & ploidy == "tet"]),
+    norm = round(sqrt(S_N^2 + S_P^2), 5)
+    ) %>%
+  select(-S_t, -meanS_t)%>%
+  mutate(norm = ifelse(ave(norm, norm, FUN = length) >= 4, NA, norm)) %>%
+  mutate(
+    u_N = S_N / norm,
+    u_P = S_P / norm,
+    
+#if the vectors are wrong, inverse tet with dip
+    x_ori = R_etoile_tet %>% filter(nutrient == "N") %>% pull(R_min),
+    y_ori = R_etoile_dip %>% filter(nutrient == "P") %>% pull(R_min),
+    x_end_vector = x_ori - 0.2 * sc * u_N,
+    y_end_vector = y_ori - 0.2 * sc * u_P,
+    x_coex = x_ori + sc * u_N,
+    y_coex = y_ori + sc * u_P)
+
+theta <- consumption_vectors %>%
+  filter(ploidy %in% c("dip", "tet")) %>%
+  select(condition, ploidy, u_N, u_P) %>%
+  group_by(condition, ploidy) %>% 
+  summarise(
+    u_N = mean(u_N, na.rm = TRUE),
+    u_P = mean(u_P, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = ploidy,
+    values_from = c(u_N, u_P)
+  ) %>%
+  filter(
+    !is.na(u_N_dip), !is.na(u_N_tet),
+    !is.na(u_P_dip), !is.na(u_P_tet)
+  ) %>%
+  mutate(
+    theta_rad = acos(u_N_dip * u_N_tet + u_P_dip * u_P_tet),
+    theta_deg = theta_rad * 180/pi
+  )
+
+
+
+
+shade_df <- consumption_vectors %>%
+  mutate(
+    x_end = x_ori + sc * u_N,
+    y_end = y_ori + sc * u_P
+  )
+
+poly_df <- shade_df %>%
+  filter(ploidy %in% c("dip", "tet")) %>%
+  arrange(ploidy) %>%
+  reframe(
+    x = c(x_ori[38], x_end[38], x_end[39]),
+    y = c(y_ori[38], y_end[38], y_end[39])
+  )
+
+p_ <- ggplot() +
+  #geom_polygon(data = poly_df, aes(x, y),
+   # fill = "grey80", alpha = 0.5) +
+  
+  geom_segment(aes(
+    x = R_etoile_dip %>% filter(nutrient == "N") %>% pull(R_min),
+    xend = 3,
+    y = R_etoile_dip %>% filter(nutrient == "P") %>% pull(R_min),
+    yend = R_etoile_dip %>% filter(nutrient == "P") %>% pull(R_min)
+  ), color = "dodgerblue", linewidth = 1) +
+
+geom_segment(aes(
+    x = R_etoile_dip %>% filter(nutrient == "N") %>% pull(R_min),
+    xend = R_etoile_dip %>% filter(nutrient == "N") %>% pull(R_min),
+    y = R_etoile_dip %>% filter(nutrient == "P") %>% pull(R_min),
+    yend = 0.03
+  ), color = "dodgerblue", linewidth = 1) +
+
+geom_segment(aes(
+    x = R_etoile_tet %>% filter(nutrient == "N") %>% pull(R_min),
+    xend = 3,
+    y = R_etoile_tet %>% filter(nutrient == "P") %>% pull(R_min),
+    yend = R_etoile_tet %>% filter(nutrient == "P") %>% pull(R_min)
+  ), color = "deeppink", linewidth = 1) +
+
+geom_segment(aes(
+    x = R_etoile_tet %>% filter(nutrient == "N") %>% pull(R_min),
+    xend = R_etoile_tet %>% filter(nutrient == "N") %>% pull(R_min),
+    y = R_etoile_tet %>% filter(nutrient == "P") %>% pull(R_min),
+    yend = 0.03
+  ), color = "deeppink", linewidth = 1) +
+
+  #geom_segment(
+   # data = shade_df,
+    #aes(x = x_ori, y = y_ori,
+     #   xend = x_end_vector, yend = y_end_vector,
+      #  color = ploidy),
+    #linewidth = 0.8, arrow = arrow(length = unit(0.25, "cm"))) +
+  
+  #geom_segment(
+   # data = shade_df,
+    #aes(x = x_ori, y = y_ori, xend = x_coex, yend = y_coex,
+     #   color = ploidy),
+    #linewidth = 0.8, linetype = "dashed") +
+  
+  scale_color_manual(values = c("dip" = "royalblue", "tet" = "deeppink3")) +
+  
+  #annotate("text", 
+   #        label = paste0("θ = ", round(theta["theta_deg"], 2), "°   cos(θ) = ", #round(cos(theta["theta_rad"]), 3)), size = 3.5, x = 1, y = 0.02) +
+  
+  labs(x = "NO3", y = "PO4") +
+  theme_bw()
+
+p_
+
+```
+
+# Test
+
+```{r }
+# Time points
+times <- seq(from = 0, to = 50, length.out = 100)
+
+# Function T(t)
+T_fun <- function(t, N0, V, r, S0, K) {
+  (N0 * V / r) * (exp(r * t) - 1) + S0 + K * log(S0)
+}
+
+# Solve S + K ln S = T(t)
+solve_S <- function(Tt, K) {
+  f <- function(S) S + K * log(S) - Tt
+  
+  lower <- .Machine$double.eps
+  upper <- max(1, Tt) * 1000
+  
+  uniroot(f, interval = c(lower, upper))$root
+}
+
+
+# Compute S(t) and consumption C(t)
+compute_consumption <- function(N0, V, r, K, S0, times) {
+  T_vals <- T_fun(times, N0, V, r, S0, K)
+  S_vals <- sapply(T_vals, solve_S, K = K)
+  C_vals <- N0 * exp(r * times) * V * (S_vals / (K + S_vals))
+  
+  tibble(
+    t   = times,
+    S_t = S_vals,
+    C_t = C_vals
+  )
+}
+
+
+# Apply to your ploidy × medium parameters
+
+R_etoile <- R_ %>%
+  left_join(VK_, by = c("ploidy", "medium")) %>%
+  left_join(
+    conditions %>% select(ploidy, nutrient),
+    by = c("ploidy" = "ploidy", "medium" = "nutrient")) %>%
+  mutate(
+    R_min = (r * qmin * K) /
+            (V * (r) - r * qmin)
+  )
+
+consumption_vectors <- R_etoile %>%
+  mutate(
+    S0 = ifelse(medium == "N", 550, 50),
+    out = pmap(
+      list(N0, V, r, K, S0),
+      ~ compute_consumption(..1, ..2, ..3, ..4, ..5, times)
+    )
+  ) %>%
+  unnest(out) %>%
+  mutate(
+    S_N = ifelse(medium == "N", C_t, NA_real_),
+    S_P = ifelse(medium == "P", C_t, NA_real_)
+  ) %>%
+  select(ploidy, medium, t, S_N, S_P) %>%
+  pivot_wider(
+    names_from = medium,
+    values_from = c(S_N, S_P)
+  ) %>%
+  rename(
+    S_N = S_N_N,
+    S_P = S_P_P
+  ) %>%
+  mutate(
+    norm = sqrt(S_N^2 + S_P^2),
+    u_N = S_N / norm,
+    u_P = S_P / norm,
+    x_start = R_dip["N"],
+    y_start = R_tet["P"],
+    x_end   = x_start - 0.1 * u_N,
+    y_end   = y_start - 0.1 * u_P,
+    x_dash  = x_start + 0.1 * u_N,
+    y_dash  = y_start + 0.1 * u_P
+    ) %>%
+  group_by(t) %>%
+  mutate(
+    # dip vector
+    v1_N = u_N[ploidy == "dip"],
+    v1_P = u_P[ploidy == "dip"],
+
+    # tet vector
+    v2_N = u_N[ploidy == "tet"],
+    v2_P = u_P[ploidy == "tet"],
+
+    # angle
+    theta = acos(v1_N * v2_N + v1_P * v2_P),
+    theta_deg = theta * 180 / pi
+  ) %>%
+  ungroup()
+
+
+library(gganimate)
+
+p_anim <- ggplot(consumption_vectors) +
+  
+  # Dip ZNGI
+  geom_segment(
+    aes(x = R_dip["N"], xend = 0.25,
+        y = R_dip["P"], yend = R_dip["P"]),
+    inherit.aes = FALSE,
+    color = "dodgerblue", linewidth = 1
+  ) +
+  geom_segment(
+    aes(x = R_dip["N"], xend = R_dip["N"],
+        y = R_dip["P"], yend = 0.1),
+    inherit.aes = FALSE,
+    color = "dodgerblue", linewidth = 1
+  ) +
+  
+  # Tet ZNGI
+  geom_segment(
+    aes(x = R_tet["N"], xend = 0.25,
+        y = R_tet["P"], yend = R_tet["P"]),
+    inherit.aes = FALSE,
+    color = "deeppink", linewidth = 1
+  ) +
+  geom_segment(
+    aes(x = R_tet["N"], xend = R_tet["N"],
+        y = R_tet["P"], yend = 0.1),
+    inherit.aes = FALSE,
+    color = "deeppink", linewidth = 1
+  ) +
+  
+  # Consumption vectors
+  geom_segment(
+    aes(x = x_start, y = y_start,
+        xend = x_end, yend = y_end,
+        color = ploidy),
+    linewidth = 1,
+    arrow = arrow(length = unit(0.25, "cm"))
+  ) +
+  
+  geom_segment(
+    aes(x = x_start, y = y_start,
+        xend = x_dash, yend = y_dash,
+        color = ploidy),
+    linewidth = 0.8,
+    linetype = "dashed"
+  ) +
+  
+  scale_color_manual(values = c("dip" = "royalblue", "tet" = "deeppink3")) +
+  
+  labs(
+    x = "NO3 (mmol.L-1)",
+    y = "PO4 (mmol.L-1)",
+    title = "Consumption vectors at time t = {closest_state}"
+  ) +
+  
+  theme_bw() +
+  
+  transition_states(t, transition_length = 2, state_length = 1)
+
+anim <- gganimate::animate(
+  p_anim,
+  nframes = 120,
+  fps = 20,
+  width = 800,
+  height = 600
+)
+
+gganimate::anim_save(
+  "C:/Users/tozah/Desktop/Internship Ghent University/Protocols & Experiments/consumption_vectors.gif",
+  animation = anim
+)
+
+# data.frame to be filled
+wf_df <- data.frame()
+
+# effective population sizes
+sizes <- c(200, 1000, 5000)
+
+# starting allele frequencies
+starting_p <- c(.1, .5)
+
+# number of generations
+n_gen <- 1000
+
+# number of replicates per simulation
+n_reps <- 50
+
+# run the simulations
+for(N in sizes){
+  for(p in starting_p){
+    p0 <- p
+    for(j in 1:n_gen){
+      X <- rbinom(n_reps, 2*N, p)
+      p <- X / (2*N)
+      rows <- data.frame(replicate = 1:n_reps, N = rep(N, n_reps), 
+                         gen = rep(j, n_reps), p0 = rep(p0, n_reps), 
+                         p = p)
+      wf_df <- bind_rows(wf_df, rows)
+    }
+  }
+}
+
+# plot it up!
+p <- ggplot(wf_df, aes(x = gen, y = p, group = replicate)) +
+     geom_path(alpha = .5) + facet_grid(N ~ p0) + guides(colour=FALSE)
+p
+```
+
+
+# Finding equilibriums in the Droop model
+
+```{r }
+# state vector (example equilibrium)
+state <- c(
+  Ndip = 1,
+  Ntet = 1,
+  QdN  = 0.5,
+  QtN  = 0.5,
+  QdP  = 0.5,
+  QtP  = 0.5,
+  SN   = 550,
+  SP   = 50
+)
+
+# parameter list
+p <- readRDS("C:/Users/tozah/Desktop/Internship Ghent University/Protocols & Experiments/p.RDS")
+
+jacobian <- function(x,p){
+  Nd<-x[1]; Nt<-x[2]; QdN<-x[3]; QtN<-x[4]; QdP<-x[5]; QtP<-x[6]; SN<-x[7]; SP<-x[8]
+  g  <- function(S,K) S/(S+K); gp <- function(S,K) K/(S+K)^2
+  J <- matrix(0,8,8)
+  J[1,1] <- p$r_dip*(1 - p$q_min_dip_N/QdN) - p$m_dip_N
+  J[1,3] <- Nd*p$r_dip*p$q_min_dip_N/QdN^2
+  J[2,2] <- p$r_tet*(1 - p$q_min_tet_N/QtN) - p$m_tet_N
+  J[2,4] <- Nt*p$r_tet*p$q_min_tet_N/QtN^2
+  J[3,3] <- -p$r_dip
+  J[3,7] <- p$V_dip_N*gp(SN,p$K_dip_N)
+  J[4,4] <- -p$r_tet
+  J[4,7] <- p$V_tet_N*gp(SN,p$K_tet_N)
+  J[5,5] <- -p$r_dip
+  J[5,8] <- p$V_dip_P*gp(SP,p$K_dip_P)
+  J[6,6] <- -p$r_tet
+  J[6,8] <- p$V_tet_P*gp(SP,p$K_tet_P)
+  J[7,1] <- -p$V_dip_N*g(SN,p$K_dip_N)
+  J[7,2] <- -p$V_tet_N*g(SN,p$K_tet_N)
+  J[7,7] <- -(Nd*p$V_dip_N*gp(SN,p$K_dip_N) + Nt*p$V_tet_N*gp(SN,p$K_tet_N))
+  J[8,1] <- -p$V_dip_P*g(SP,p$K_dip_P)
+  J[8,2] <- -p$V_tet_P*g(SP,p$K_tet_P)
+  J[8,8] <- -(Nd*p$V_dip_P*gp(SP,p$K_dip_P) + Nt*p$V_tet_P*gp(SP,p$K_tet_P))
+  J
+}
+
+J  <- jacobian(state, p)
+tr <- sum(diag(J))
+dt <- det(J)
+
+tr
+dt
+
+tr_range <- seq(-2, 2, length.out = 500)
+det_curve <- tr_range^2 / 4
+
+df_curve <- data.frame(
+  det = det_curve,
+  tr  = tr_range
+)
+
+ggplot() +
+  geom_line(data = df_curve, aes(tr, det), color = "dodgerblue", linewidth = 1) +
+  geom_point(aes(tr, dt), size = 3, color = "blue") +
+  geom_vline(xintercept = 0, color = "black", linewidth = 0.6) +
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.6) +
+  labs(x = "trace(J)", y = "det(J)") +
+  theme_minimal()
+
+
+
+```
+
+```{python}
+
+x = 0
+y = 2
+
+if(x == 0){
+  y = 1
+} else {
+  y = 0
+}
+
+print(y)
+
+```
